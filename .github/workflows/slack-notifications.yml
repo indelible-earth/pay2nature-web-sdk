@@ -1,0 +1,214 @@
+name: Slack notifications
+# Posts to the team Slack channel: the result of this repository's pipelines (passes and failures,
+# naming the GitHub user who triggered the run, with their avatar) and a review ping when a pull
+# request is ready. Needs the repository secret SLACK_WEBHOOK_URL; without it this does nothing and
+# never fails. Run it manually (Actions tab, "Slack notifications") to send a sample message.
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      test:
+        description: Send a sample message of this kind to check the Slack connection
+        type: choice
+        options: [pipeline, review]
+        default: review
+  # To also report pipeline results, add this under 'on:' (it must be on the default branch):
+  #   workflow_run:
+  #     workflows: ['<name of the pipeline>']
+  #     types: [completed]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  notify:
+    name: Slack notification
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Post to Slack
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          USER_MAP: ${{ vars.SLACK_USER_MAP }}
+          DEVOPS_MENTION: ${{ vars.SLACK_DEVOPS_MENTION }}
+          REVIEWER_ID: ${{ vars.SLACK_REVIEWER_ID }}
+          REVIEWER_LOGIN: ${{ vars.SLACK_REVIEWER_GITHUB }}
+          KIND: ${{ github.event_name == 'workflow_run' && 'pipeline' || (github.event_name == 'workflow_dispatch' && inputs.test) || 'review' }}
+          DEVOPS_PATTERN: 'deploy|release|terraform|iac|infra|plan|apply|rollout|smoke|auth|identity|image|container|build|push|sign|sbom|dockerfile|workflow|detect'
+          IGNORE_PATTERN: 'all checks passed|checks passed'
+          TEST_MODE: ${{ github.event_name == 'workflow_dispatch' }}
+          REPO: ${{ github.repository }}
+          WR_ID: ${{ github.event.workflow_run.id }}
+          WR_NAME: ${{ github.event.workflow_run.name }}
+          WR_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          WR_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          WR_SHA: ${{ github.event.workflow_run.head_sha }}
+          WR_TITLE: ${{ github.event.workflow_run.display_title }}
+          WR_EVENT: ${{ github.event.workflow_run.event }}
+          WR_URL: ${{ github.event.workflow_run.html_url }}
+          WR_NUMBER: ${{ github.event.workflow_run.run_number }}
+          WR_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          WR_ACTOR: ${{ github.event.workflow_run.actor.login }}
+          WR_AVATAR: ${{ github.event.workflow_run.actor.avatar_url }}
+          WR_PR: ${{ github.event.workflow_run.pull_requests[0].number }}
+          PR_ACTION: ${{ github.event.action }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_AVATAR: ${{ github.event.pull_request.user.avatar_url }}
+          PR_BASE: ${{ github.event.pull_request.base.ref }}
+          PR_HEAD: ${{ github.event.pull_request.head.ref }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+          PR_ADD: ${{ github.event.pull_request.additions }}
+          PR_DEL: ${{ github.event.pull_request.deletions }}
+          PR_FILES: ${{ github.event.pull_request.changed_files }}
+        run: |
+          set -uo pipefail
+          # A pasted secret often carries a trailing newline or space; strip all whitespace.
+          SLACK_WEBHOOK_URL=$(printf '%s' "${SLACK_WEBHOOK_URL:-}" | tr -d '[:space:]')
+          if [ -z "${SLACK_WEBHOOK_URL:-}" ] && [ "${DRY_RUN:-}" != "1" ]; then
+            echo "::notice::SLACK_WEBHOOK_URL is not set for this repository, so no Slack message was sent."
+            exit 0
+          fi
+
+          # Everything from the event is untrusted text: neutralise Slack formatting and mentions.
+          esc() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+          user_map="${USER_MAP:-}"
+          printf '%s' "$user_map" | jq -e . >/dev/null 2>&1 || user_map='{}'
+          slack_user() {
+            local id
+            id=$(printf '%s' "$user_map" | jq -r --arg u "$1" '.[$u] // empty' 2>/dev/null)
+            if [[ "$id" =~ ^[UW][A-Z0-9]+$ ]]; then printf '<@%s>' "$id"; fi
+          }
+          avatar() {
+            case "$1" in
+              https://avatars.githubusercontent.com/*)
+                case "$1" in *\?*) printf '%s&s=64' "$1" ;; *) printf '%s?s=64' "$1" ;; esac ;;
+              *) printf '' ;;
+            esac
+          }
+          post() {
+            if [ "${DRY_RUN:-}" = "1" ]; then printf '%s\n' "$1"; return 0; fi
+            local code
+            code=$(curl -sS -o /tmp/slack.out -w '%{http_code}' --max-time 20 -X POST \
+              -H 'Content-type: application/json' --data "$1" "$SLACK_WEBHOOK_URL") || code=000
+            if [ "$code" = "200" ]; then echo "Slack accepted the message."; else
+              echo "::warning::Slack returned HTTP $code: $(head -c 200 /tmp/slack.out 2>/dev/null)"; fi
+          }
+
+          if [ "$KIND" = "review" ]; then
+            if [ "${TEST_MODE:-false}" = "true" ]; then
+              PR_ACTION=opened; PR_NUMBER=42; PR_TITLE="Sample pull request"; PR_URL="https://github.com/$REPO/pull/42"
+              PR_AUTHOR="octocat"; PR_AVATAR="https://avatars.githubusercontent.com/u/583231?v=4"; PR_BASE=main; PR_HEAD=feature/sample
+              PR_DRAFT=false; PR_ADD=12; PR_DEL=3; PR_FILES=2
+            fi
+            case "$PR_ACTION" in opened|reopened|ready_for_review) ;; *) echo "No message for action '$PR_ACTION'."; exit 0 ;; esac
+            if [ "$PR_DRAFT" = "true" ]; then echo "Draft pull request; waiting until it is ready for review."; exit 0; fi
+            case "$PR_AUTHOR" in *"[bot]") echo "Bot-authored pull request; no review ping."; exit 0 ;; esac
+
+            reviewer_login="${REVIEWER_LOGIN:-benj}"
+            tag=""
+            if [[ "${REVIEWER_ID:-}" =~ ^[UW][A-Z0-9]+$ ]] && [ "$PR_AUTHOR" != "$reviewer_login" ]; then tag="<@${REVIEWER_ID}>"; fi
+            if [ -n "$tag" ]; then ask="$tag, please review this pull request."
+            elif [ "$PR_AUTHOR" = "$reviewer_login" ]; then ask="Opened by the reviewer, so nobody is tagged."
+            else ask="No reviewer is configured for this repository (set SLACK_REVIEWER_ID)."; fi
+
+            title=$(printf '%s' "$PR_TITLE" | cut -c1-140 | esc)
+            author=$(printf '%s' "$PR_AUTHOR" | esc)
+            base=$(printf '%s' "$PR_BASE" | esc); head=$(printf '%s' "$PR_HEAD" | esc)
+            payload=$(jq -n \
+              --arg header "Review needed: ${REPO}#${PR_NUMBER}" \
+              --arg main "*<${PR_URL}|#${PR_NUMBER} ${title}>*"$'\n'"+${PR_ADD:-0} / -${PR_DEL:-0} across ${PR_FILES:-0} files" \
+              --arg who "*${author}* opened this into \`${base}\` from \`${head}\`" \
+              --arg img "$(avatar "$PR_AVATAR")" --arg alt "$(printf '%s' "$PR_AUTHOR" | tr -d '<>&')" \
+              --arg ask "$ask" --arg url "${PR_URL}/files" \
+              --arg fallback "Review needed: ${REPO}#${PR_NUMBER} by ${author}" '
+              { text: $fallback, blocks: [
+                { type: "header", text: { type: "plain_text", text: $header, emoji: true } },
+                { type: "section", text: { type: "mrkdwn", text: $main } },
+                { type: "context", elements: (
+                    (if $img != "" then [ { type: "image", image_url: $img, alt_text: $alt } ] else [] end)
+                    + [ { type: "mrkdwn", text: $who } ] ) },
+                { type: "section", text: { type: "mrkdwn", text: $ask } },
+                { type: "actions", elements: [ { type: "button", text: { type: "plain_text", text: "Review pull request" }, url: $url } ] }
+              ] }')
+            post "$payload"
+            exit 0
+          fi
+
+          # ---- kind: pipeline ----
+          if [ "${TEST_MODE:-false}" = "true" ]; then
+            WR_NAME="Sample pipeline"; WR_CONCLUSION=failure; WR_BRANCH=main; WR_SHA=0123456789abcdef; WR_TITLE="Sample commit"
+            WR_EVENT=push; WR_URL="https://github.com/$REPO/actions"; WR_NUMBER=7; WR_ATTEMPT=1; WR_ACTOR="octocat"
+            WR_AVATAR="https://avatars.githubusercontent.com/u/583231?v=4"; WR_PR=""; WR_ID=0
+          fi
+          case "$WR_CONCLUSION" in
+            success) status=success ;;
+            failure|timed_out|startup_failure) status=failure ;;
+            *) echo "No message for conclusion '${WR_CONCLUSION}'."; exit 0 ;;
+          esac
+          case "$WR_EVENT" in
+            pull_request|pull_request_target|schedule)
+              [ "$status" = failure ] || { echo "No message for a passing ${WR_EVENT} run."; exit 0; } ;;
+          esac
+
+          failed=""
+          if [ "$status" = "failure" ]; then
+            if [ "${TEST_MODE:-false}" = "true" ]; then
+              jobs_json='[{"name":"Lint and unit tests","conclusion":"failure"},{"name":"Plan and apply (stack)","conclusion":"failure"},{"name":"Static analysis","conclusion":"success"}]'
+            else
+              jobs_json=$(gh api --paginate "repos/${REPO}/actions/runs/${WR_ID}/jobs?per_page=100" --jq '[.jobs[] | {name, conclusion}]' 2>/dev/null | jq -s 'add // []') || jobs_json='[]'
+            fi
+            failed=$(printf '%s' "$jobs_json" | jq -r --arg ign "${IGNORE_PATTERN:-^$}" '.[] | select(.conclusion=="failure" or .conclusion=="timed_out") | select(.name | test($ign; "i") | not) | .name')
+          fi
+
+          dev_jobs=(); ops_jobs=()
+          while IFS= read -r name; do
+            [ -n "$name" ] || continue
+            if printf '%s' "$name" | grep -Eiq "${DEVOPS_PATTERN:-^$}"; then ops_jobs+=("$name"); else dev_jobs+=("$name"); fi
+          done <<< "$failed"
+
+          actor_esc=$(printf '%s' "$WR_ACTOR" | esc)
+          ops_tag="${DEVOPS_MENTION:-}"
+          [[ "$ops_tag" =~ ^(<@[UW][A-Z0-9]+>|<!subteam\^S[A-Z0-9]+>)( (<@[UW][A-Z0-9]+>|<!subteam\^S[A-Z0-9]+>))*$ ]] || ops_tag="*DevOps*"
+          dev_tag="$(slack_user "$WR_ACTOR")"; [ -n "$dev_tag" ] || dev_tag="*${actor_esc}*"
+          owners=""
+          if [ ${#dev_jobs[@]} -gt 0 ]; then owners="${dev_tag} - code checks failed in this change"; fi
+          if [ ${#ops_jobs[@]} -gt 0 ]; then owners="${owners:+$owners$'\n'}${ops_tag} - deployment or infrastructure failure"; fi
+          failed_text=""
+          if [ -n "$failed" ]; then failed_text=$(printf '%s\n' "$failed" | esc | sed 's/^/• /'); fi
+
+          case "$status" in success) emoji="✅"; verb="passed" ;; *) emoji="❌"; verb="failed" ;; esac
+          case "$WR_EVENT" in
+            push) what="pushed to" ;;
+            pull_request|pull_request_target) what="updated a pull request" ;;
+            workflow_dispatch) what="started a manual run on" ;;
+            schedule) what="scheduled run on" ;;
+            *) what="triggered a run on" ;;
+          esac
+          [ -z "${WR_PR:-}" ] || what="$what #${WR_PR} for"
+          wf=$(printf '%s' "$WR_NAME" | esc); br=$(printf '%s' "$WR_BRANCH" | esc)
+          subject=$(printf '%s' "$WR_TITLE" | head -n1 | cut -c1-100 | esc)
+          short="${WR_SHA:0:7}"
+          payload=$(jq -n \
+            --arg header "${emoji} ${REPO}: $(printf '%s' "$WR_NAME" | tr -d '<>&') ${verb}" \
+            --arg who "*${actor_esc}* ${what} \`${br}\`" \
+            --arg img "$(avatar "$WR_AVATAR")" --arg alt "$(printf '%s' "$WR_ACTOR" | tr -d '<>&')" \
+            --arg commit "\`${short}\` ${subject}" --arg run "#${WR_NUMBER} (attempt ${WR_ATTEMPT:-1})" \
+            --arg failed "$failed_text" --arg owners "$owners" --arg url "$WR_URL" \
+            --arg fallback "${emoji} ${REPO}: ${wf} ${verb} (${actor_esc})" '
+            { text: $fallback, blocks: (
+              [ { type: "header", text: { type: "plain_text", text: $header, emoji: true } },
+                { type: "context", elements: (
+                    (if $img != "" then [ { type: "image", image_url: $img, alt_text: $alt } ] else [] end)
+                    + [ { type: "mrkdwn", text: $who } ] ) },
+                { type: "section", fields: [
+                    { type: "mrkdwn", text: ("*Commit*\n" + $commit) },
+                    { type: "mrkdwn", text: ("*Run*\n" + $run) } ] } ]
+              + (if $failed != "" then [ { type: "section", text: { type: "mrkdwn", text: ("*Failed jobs*\n" + $failed) } } ] else [] end)
+              + (if $owners != "" then [ { type: "section", text: { type: "mrkdwn", text: ("*Please look:*\n" + $owners) } } ] else [] end)
+              + [ { type: "actions", elements: [ { type: "button", text: { type: "plain_text", text: "View run" }, url: $url } ] } ] ) }')
+          post "$payload"
+          exit 0
